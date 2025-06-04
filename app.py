@@ -3,8 +3,8 @@ import os
 import random
 import string
 import time
-import sqlite3
-from datetime import datetime, timedelta
+import psycopg2
+from datetime import datetime
 from telegram import (
     Update, ReplyKeyboardMarkup, ReplyKeyboardRemove, InlineKeyboardMarkup, InlineKeyboardButton
 )
@@ -12,16 +12,13 @@ from telegram.ext import (
     ApplicationBuilder, CommandHandler, MessageHandler, filters, ConversationHandler, ContextTypes, CallbackQueryHandler
 )
 from github_sync import ensure_file_and_push, push_to_github
-from config import TELEGRAM_TOKEN
-
+from config import TELEGRAM_TOKEN, ADMIN_IDS, DATABASE_URL
+ 
 BOT_NAME = "TS"
 
 CHOOSING, PAYMENT_METHOD, PAYMENT_NUMBER, PAYMENT_REF, INSCRIPTION_NAME, INSCRIPTION_SURNAME, INSCRIPTION_PHONE, INSCRIPTION_ID = range(8)
-ADMIN_IDS = [7380096986, 7338962524]  # ⚠️ Remplacer par tes deux vrais Telegram ID admin !
 
 KEY_VALIDITY_SECONDS = 30 * 24 * 3600
-
-DB_FILE = "users.db"
 
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
@@ -29,14 +26,11 @@ logging.basicConfig(
 )
 
 def get_db():
-    conn = sqlite3.connect(DB_FILE)
-    conn.row_factory = sqlite3.Row
-    return conn
+    return psycopg2.connect(DATABASE_URL, sslmode='require')
 
 def ensure_db():
     conn = get_db()
     c = conn.cursor()
-    # Table des utilisateurs
     c.execute("""
         CREATE TABLE IF NOT EXISTS users (
             name TEXT,
@@ -47,7 +41,6 @@ def ensure_db():
             status TEXT
         )
     """)
-    # Table des codes
     c.execute("""
         CREATE TABLE IF NOT EXISTS codes (
             user_id TEXT,
@@ -72,16 +65,17 @@ def format_date(ts):
     return datetime.fromtimestamp(int(ts)).strftime("%d/%m/%Y")
 
 def key_is_valid(code_row):
-    if code_row["active"] != "validated":
+    # code_row is a tuple!
+    if code_row[4] != "validated":
         return False
-    ts = int(code_row["timestamp"])
+    ts = int(code_row[5])
     return now_ts() - ts < KEY_VALIDITY_SECONDS
 
 def user_has_valid_code(user_id):
     ensure_db()
     conn = get_db()
     c = conn.cursor()
-    c.execute("SELECT * FROM codes WHERE user_id = ? AND active = 'validated'", (user_id,))
+    c.execute("SELECT * FROM codes WHERE user_id = %s AND active = 'validated'", (user_id,))
     row = c.fetchone()
     conn.close()
     if row and key_is_valid(row):
@@ -203,15 +197,15 @@ async def payment_ref(update: Update, context: ContextTypes.DEFAULT_TYPE):
     timestamp = now_ts()
     conn = get_db()
     c = conn.cursor()
-    c.execute("SELECT * FROM codes WHERE user_id = ? AND active != 'deleted'", (user_id,))
+    c.execute("SELECT * FROM codes WHERE user_id = %s AND active != 'deleted'", (user_id,))
     row = c.fetchone()
     already_exist = False
     if row:
         already_exist = True
-        code = row["code"]
-        c.execute("UPDATE codes SET active = 'pending', timestamp = ? WHERE user_id = ?", (str(timestamp), user_id))
+        code = row[1]  # code is at index 1
+        c.execute("UPDATE codes SET active = 'pending', timestamp = %s WHERE user_id = %s", (str(timestamp), user_id))
     if not already_exist:
-        c.execute("INSERT OR REPLACE INTO codes (user_id, code, payment_method, payment_number, active, timestamp) VALUES (?, ?, ?, ?, ?, ?)",
+        c.execute("INSERT INTO codes (user_id, code, payment_method, payment_number, active, timestamp) VALUES (%s, %s, %s, %s, %s, %s) ON CONFLICT (user_id, code) DO UPDATE SET payment_method = EXCLUDED.payment_method, payment_number = EXCLUDED.payment_number, active = EXCLUDED.active, timestamp = EXCLUDED.timestamp",
                   (user_id, code, context.user_data.get("payment_method", ""), context.user_data.get("payment_number", ""), "pending", str(timestamp)))
     conn.commit()
     conn.close()
@@ -258,10 +252,10 @@ async def inscription_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ensure_db()
     conn = get_db()
     c = conn.cursor()
-    c.execute("SELECT * FROM users WHERE user_id = ?", (user_id,))
+    c.execute("SELECT * FROM users WHERE user_id = %s", (user_id,))
     already_exist = c.fetchone()
     if not already_exist:
-        c.execute("INSERT INTO users (name, surname, phone, user_id, telegram_id, status) VALUES (?, ?, ?, ?, ?, ?)",
+        c.execute("INSERT INTO users (name, surname, phone, user_id, telegram_id, status) VALUES (%s, %s, %s, %s, %s, %s)",
                   (context.user_data["name"], context.user_data["surname"], context.user_data["phone"], user_id, str(update.effective_user.id), "active"))
         conn.commit()
     conn.close()
@@ -328,11 +322,11 @@ async def show_admin_users(query, context):
         text += "\nAucun inscrit."
     else:
         for row in users:
-            user_id = row["user_id"]
-            nom = row["name"]
-            prenom = row["surname"]
-            phone = row["phone"]
-            status = row["status"] if row["status"] else "active"
+            user_id = row[3]
+            nom = row[0]
+            prenom = row[1]
+            phone = row[2]
+            status = row[5] if row[5] else "active"
             icon = "✅" if status == "active" else "🚫"
             text += f"{icon} <b>{nom} {prenom}</b> (ID: <code>{user_id}</code>, Tel: {phone})\n"
             label = "🚫 Désactiver" if status == "active" else "✅ Réactiver"
@@ -345,12 +339,12 @@ async def toggle_user_status(query, context, target_user_id):
     ensure_db()
     conn = get_db()
     c = conn.cursor()
-    c.execute("SELECT status FROM users WHERE user_id = ?", (target_user_id,))
+    c.execute("SELECT status FROM users WHERE user_id = %s", (target_user_id,))
     row = c.fetchone()
     if row:
-        current_status = row["status"]
+        current_status = row[0]
         new_status = "inactive" if current_status == "active" else "active"
-        c.execute("UPDATE users SET status = ? WHERE user_id = ?", (new_status, target_user_id))
+        c.execute("UPDATE users SET status = %s WHERE user_id = %s", (new_status, target_user_id))
         conn.commit()
         status_msg = f"Utilisateur {target_user_id} est maintenant {new_status.upper()}."
     else:
@@ -369,11 +363,11 @@ async def show_admin_payments(query, context):
     rows = c.fetchall()
     found = False
     for row in rows:
-        user_id = row["user_id"]
-        code = row["code"]
-        method = row["payment_method"]
-        num = row["payment_number"]
-        state = row["active"]
+        user_id = row[0]
+        code = row[1]
+        method = row[2]
+        num = row[3]
+        state = row[4]
         found = True
         text += f"\n• <b>ID</b>: <code>{user_id}</code> | <b>Méthode</b>: {method} | <b>N°</b>: {num}"
         buttons.append([
@@ -390,19 +384,17 @@ async def validate_payment(query, context, target_user_id):
     ensure_db()
     conn = get_db()
     c = conn.cursor()
-    c.execute("SELECT * FROM codes WHERE user_id = ? AND active = 'pending'", (target_user_id,))
+    c.execute("SELECT * FROM codes WHERE user_id = %s AND active = 'pending'", (target_user_id,))
     row = c.fetchone()
     code = None
     if row:
-        code = row["code"]
-        c.execute("UPDATE codes SET active = 'validated', timestamp = ? WHERE user_id = ? AND active = 'pending'", (str(now_ts()), target_user_id))
+        code = row[1]
+        c.execute("UPDATE codes SET active = 'validated', timestamp = %s WHERE user_id = %s AND active = 'pending'", (str(now_ts()), target_user_id))
         conn.commit()
-    # Trouver le telegram_id associé à ce user_id
-    c.execute("SELECT telegram_id FROM users WHERE user_id = ?", (target_user_id,))
+    c.execute("SELECT telegram_id FROM users WHERE user_id = %s", (target_user_id,))
     row2 = c.fetchone()
-    tgid = row2["telegram_id"] if row2 else None
+    tgid = row2[0] if row2 else None
     conn.close()
-    # Envoi du code par DM
     if tgid and code:
         try:
             await context.bot.send_message(
@@ -422,7 +414,7 @@ async def delete_payment(query, context, target_user_id):
     ensure_db()
     conn = get_db()
     c = conn.cursor()
-    c.execute("UPDATE codes SET active = 'deleted' WHERE user_id = ? AND active = 'pending'", (target_user_id,))
+    c.execute("UPDATE codes SET active = 'deleted' WHERE user_id = %s AND active = 'pending'", (target_user_id,))
     conn.commit()
     conn.close()
     await show_admin_payments(query, context)
@@ -434,24 +426,24 @@ def get_userid_from_telegram(telegram_id):
     ensure_db()
     conn = get_db()
     c = conn.cursor()
-    c.execute("SELECT user_id FROM users WHERE telegram_id = ?", (str(telegram_id),))
+    c.execute("SELECT user_id FROM users WHERE telegram_id = %s", (str(telegram_id),))
     row = c.fetchone()
     conn.close()
     if row:
-        return row["user_id"]
+        return row[0]
     return None
 
 def get_user_code_info(user_id):
     ensure_db()
     conn = get_db()
     c = conn.cursor()
-    c.execute("SELECT * FROM codes WHERE user_id = ? AND active = 'validated'", (user_id,))
+    c.execute("SELECT * FROM codes WHERE user_id = %s AND active = 'validated'", (user_id,))
     row = c.fetchone()
     conn.close()
     if row:
-        ts = int(row["timestamp"])
+        ts = int(row[5])
         valid_until = datetime.fromtimestamp(ts + KEY_VALIDITY_SECONDS).strftime("%d/%m/%Y")
-        return row["code"], valid_until
+        return row[1], valid_until
     return None, None
 
 # ========== MAIN
